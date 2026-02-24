@@ -1,0 +1,173 @@
+import os
+import time
+import argparse
+
+import torch
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+from torch_geometric.datasets import Reddit
+from torch_geometric.loader import NeighborLoader
+
+from GraphSAGE import GraphSAGE
+from stat_metrics import eval_f1
+from perf_metrics import count_params
+from utils import ddp_setup
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset_root", type=str, default=os.environ.get("PYG_DATA_ROOT", os.path.expandvars("$SCRATCH/pyg_datasets")))
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=1024)
+    parser.add_argument("--num_neighbors", type=int, nargs="+", default=[25, 10])
+    parser.add_argument("--hidden_channels", type=int, default=256)
+    parser.add_argument("--num_layers", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--dropout", type=float, default=0.5)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--sync_every", type=int, default=1)
+    args = parser.parse_args()
+
+    is_distributed, rank, local_rank, world_size = ddp_setup()
+    is_rank0 = (rank == 0)
+
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(args.seed + rank)
+    torch.cuda.manual_seed_all(args.seed + rank)
+
+    if is_rank0:
+        print(f"Dataset root: {args.dataset_root}")
+    dataset = Reddit(root=args.dataset_root)
+    data = dataset[0]
+    num_features = dataset.num_features
+    num_classes = dataset.num_classes
+
+    if is_rank0:
+        print(dataset)
+        print(data)
+
+    sync_every = args.sync_every
+    if sync_every < 1:
+        raise ValueError("--sync_every must be >= 1")
+
+    # Neighbor loaders for train/val/test
+    train_loader = NeighborLoader(
+        data,
+        input_nodes=data.train_mask,
+        num_neighbors=args.num_neighbors,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,  # start with 0 for stability on HPC; increase later
+    )
+
+    val_loader = NeighborLoader(
+        data,
+        input_nodes=data.val_mask,
+        num_neighbors=args.num_neighbors,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    model = GraphSAGE(
+        in_channels=num_features,
+        hidden_channels=args.hidden_channels,
+        out_channels=num_classes,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+    ).to(device)
+
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
+
+    BYTES_TO_MB = 1.0 / (1024 ** 2)
+    base_model = model.module if hasattr(model, "module") else model
+    param_count = count_params(base_model)
+    param_mb_fp16 = param_count * 2 *  BYTES_TO_MB
+    param_mb_fp32 = param_count * 4 * BYTES_TO_MB
+    param_mb_fp64 = param_count * 8 * BYTES_TO_MB
+    if is_rank0:
+        print(f"LOG,param_count={sum(p.numel() for p in model.parameters() if p.requires_grad)},"
+            f"param_mb_fp16={param_mb_fp16:.3f},param_mb_fp32={param_mb_fp32:.3f},param_mb_fp64={param_mb_fp64:.3f}", flush=True)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    comm_mb_cum_fp16 = 0
+    comm_mb_cum_fp32 = 0
+    comm_mb_cum_fp64 = 0
+
+    best_micro_f1 = 0.0
+    best_macro_f1 = 0.0
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        t0 = time.time()
+        total_loss = 0.0
+        steps = 0
+
+        for batch in train_loader:
+            batch = batch.to(device)
+            optimizer.zero_grad(set_to_none=True)
+
+            out = model(batch.x, batch.edge_index)
+            y = batch.y[: batch.batch_size]
+            out = out[: batch.batch_size]
+
+            loss = F.cross_entropy(out, y)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            steps += 1
+
+        epoch_time = time.time() - t0
+        avg_loss = total_loss / max(steps, 1)
+
+        syncs_this_epoch = (steps + sync_every - 1) // sync_every  # ceil(steps/k)
+
+        comm_mb_epoch_fp16 = syncs_this_epoch * param_mb_fp16
+        comm_mb_epoch_fp32 = syncs_this_epoch * param_mb_fp32
+        comm_mb_epoch_fp64 = syncs_this_epoch * param_mb_fp64
+
+        commMB_per_step_fp16 = (comm_mb_epoch_fp16 / steps) if steps else 0.0
+        commMB_per_step_fp32 = (comm_mb_epoch_fp32 / steps) if steps else 0.0
+        commMB_per_step_fp64 = (comm_mb_epoch_fp64 / steps) if steps else 0.0
+
+        comm_mb_cum_fp16 += comm_mb_epoch_fp16
+        comm_mb_cum_fp32 += comm_mb_epoch_fp32
+        comm_mb_cum_fp64 += comm_mb_epoch_fp64
+
+        if is_rank0:
+            eval_model = model.module if hasattr(model, "module") else model
+            micro_f1, macro_f1 = eval_f1(eval_model, val_loader, device, num_classes)
+        else:
+            micro_f1, macro_f1 = 0.0, 0.0
+        best_micro_f1 = max(best_micro_f1, micro_f1)
+        best_macro_f1 = max(best_macro_f1, macro_f1)
+
+        if is_rank0:
+            print(
+                f"LOG,epoch={epoch},loss={avg_loss:.6f},"
+                f"microF1={micro_f1:.6f},macroF1={macro_f1:.6f},"
+                f"best_microF1={best_micro_f1:.6f},"
+                f"best_macroF1={best_macro_f1:.6f},"
+                f"steps={steps},time={epoch_time:.6f},"
+                f"sync_every={sync_every},syncs={syncs_this_epoch},"
+                f"commMB_per_step_fp16={commMB_per_step_fp16:.3f},"
+                f"commMB_per_step_fp32={commMB_per_step_fp32:.3f},"
+                f"commMB_per_step_fp64={commMB_per_step_fp64:.3f},"
+                f"commMB_epoch_fp16={comm_mb_epoch_fp16:.3f},commMB_cum_fp16={comm_mb_cum_fp16:.3f},"
+                f"commMB_epoch_fp32={comm_mb_epoch_fp32:.3f},commMB_cum_fp32={comm_mb_cum_fp32:.3f},"
+                f"commMB_epoch_fp64={comm_mb_epoch_fp64:.3f},commMB_cum_fp64={comm_mb_cum_fp64:.3f}",
+                flush=True
+            )
+    if is_rank0:
+        print("Done.")
+
+    if is_distributed:
+        dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()
