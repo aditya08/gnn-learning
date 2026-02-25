@@ -1,1 +1,0 @@
-run_id,sync_every,epoch,loss,microF1,macroF1,best_microF1,best_macroF1,local_steps,epoch_steps,effective_global_steps,seed_nodes_epoch_global,seed_nodes_cum_global,target_global_steps,world_size,time,syncs,commMB_per_step_fp16,commMB_per_step_fp32,commMB_per_step_fp64,commMB_epoch_fp16,commMB_cum_fp16,commMB_epoch_fp32,commMB_cum_fp32,commMB_epoch_fp64,commMB_cum_fp64

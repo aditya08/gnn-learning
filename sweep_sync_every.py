@@ -74,7 +74,7 @@ def append_csv_rows(path: Path, run_id: str, sync_every: int, lines: List[str]):
             if not line.startswith(LOG_PREFIX):
                 continue
             kv = parse_log_line(line)
-            if not kv:
+            if not kv or "epoch" not in kv:
                 continue
 
             row = []
