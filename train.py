@@ -18,7 +18,6 @@ from utils import ddp_setup
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_root", type=str, default=os.environ.get("PYG_DATA_ROOT", os.path.expandvars("$SCRATCH/pyg_datasets")))
-    parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--num_neighbors", type=int, nargs="+", default=[25, 10])
@@ -29,10 +28,22 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--sync_every", type=int, default=1)
+    parser.add_argument("--max_steps", type=int, default=None,
+                    help="Total global optimizer steps (overrides epochs if set)")
     args = parser.parse_args()
 
     is_distributed, rank, local_rank, world_size = ddp_setup()
     is_rank0 = (rank == 0)
+
+    if args.max_steps is not None:
+        if is_distributed:
+            assert args.max_steps % world_size == 0, \
+                "--max_steps must be divisible by world_size"
+            max_local_steps = args.max_steps // world_size
+        else:
+            max_local_steps = args.max_steps
+    else:
+        max_local_steps = None
 
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed + rank)
@@ -42,6 +53,16 @@ def main():
         print(f"Dataset root: {args.dataset_root}")
     dataset = Reddit(root=args.dataset_root)
     data = dataset[0]
+
+    train_idx = data.train_mask.nonzero(as_tuple=False).view(-1)
+    val_idx   = data.val_mask.nonzero(as_tuple=False).view(-1)
+
+    # Partition across ranks for training
+    if is_distributed:
+        train_idx_rank = train_idx[rank::world_size]
+    else:
+        train_idx_rank = train_idx
+
     num_features = dataset.num_features
     num_classes = dataset.num_classes
 
@@ -56,21 +77,24 @@ def main():
     # Neighbor loaders for train/val/test
     train_loader = NeighborLoader(
         data,
-        input_nodes=data.train_mask,
+        input_nodes=train_idx_rank,
         num_neighbors=args.num_neighbors,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=0,  # start with 0 for stability on HPC; increase later
     )
 
-    val_loader = NeighborLoader(
-        data,
-        input_nodes=data.val_mask,
-        num_neighbors=args.num_neighbors,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
-    )
+    if is_rank0:
+        val_loader = NeighborLoader(
+            data,
+            input_nodes=val_idx,
+            num_neighbors=args.num_neighbors,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
+    else:
+        val_loader = None
 
     model = GraphSAGE(
         in_channels=num_features,
@@ -90,7 +114,7 @@ def main():
     param_mb_fp32 = param_count * 4 * BYTES_TO_MB
     param_mb_fp64 = param_count * 8 * BYTES_TO_MB
     if is_rank0:
-        print(f"LOG,param_count={sum(p.numel() for p in model.parameters() if p.requires_grad)},"
+        print(f"LOG,param_count={param_count},"
             f"param_mb_fp16={param_mb_fp16:.3f},param_mb_fp32={param_mb_fp32:.3f},param_mb_fp64={param_mb_fp64:.3f}", flush=True)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -101,28 +125,45 @@ def main():
 
     best_micro_f1 = 0.0
     best_macro_f1 = 0.0
-    for epoch in range(1, args.epochs + 1):
-        model.train()
+    global_step = 0
+    epoch = 0
+    seed_nodes_cum = 0
+    while True:
         t0 = time.time()
-        total_loss = 0.0
+        epoch += 1
+        model.train()
+        seed_nodes_epoch = 0
         steps = 0
-
+        total_loss = 0.0
         for batch in train_loader:
+
             batch = batch.to(device)
             optimizer.zero_grad(set_to_none=True)
 
             out = model(batch.x, batch.edge_index)
             y = batch.y[: batch.batch_size]
             out = out[: batch.batch_size]
-
+            seed_nodes_epoch += batch.batch_size
             loss = F.cross_entropy(out, y)
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
-            steps += 1
 
+            global_step += 1
+            steps += 1
+            if max_local_steps is not None and global_step >= max_local_steps:
+                break
+        seed_nodes_epoch_tensor = torch.tensor(seed_nodes_epoch, device=device, dtype=torch.long)
+        if is_distributed:
+            dist.all_reduce(seed_nodes_epoch_tensor, op=dist.ReduceOp.SUM)
+
+        seed_nodes_epoch_global = int(seed_nodes_epoch_tensor.item())
+        if is_rank0:
+            seed_nodes_cum += seed_nodes_epoch_global
         epoch_time = time.time() - t0
+        done = (max_local_steps is not None and global_step >= max_local_steps)
+
         avg_loss = total_loss / max(steps, 1)
 
         syncs_this_epoch = (steps + sync_every - 1) // sync_every  # ceil(steps/k)
@@ -146,23 +187,40 @@ def main():
             micro_f1, macro_f1 = 0.0, 0.0
         best_micro_f1 = max(best_micro_f1, micro_f1)
         best_macro_f1 = max(best_macro_f1, macro_f1)
-
         if is_rank0:
+            effective_global_steps = global_step * world_size
             print(
-                f"LOG,epoch={epoch},loss={avg_loss:.6f},"
-                f"microF1={micro_f1:.6f},macroF1={macro_f1:.6f},"
+                f"LOG,"
+                f"epoch={epoch},"
+                f"loss={avg_loss:.6f},"
+                f"microF1={micro_f1:.6f},"
+                f"macroF1={macro_f1:.6f},"
                 f"best_microF1={best_micro_f1:.6f},"
                 f"best_macroF1={best_macro_f1:.6f},"
-                f"steps={steps},time={epoch_time:.6f},"
-                f"sync_every={sync_every},syncs={syncs_this_epoch},"
+                f"local_steps={global_step},"
+                f"epoch_steps={steps},"
+                f"effective_global_steps={effective_global_steps},"
+                f"seed_nodes_epoch_global={seed_nodes_epoch_global},"
+                f"seed_nodes_cum_global={seed_nodes_cum},"
+                f"target_global_steps={args.max_steps if args.max_steps is not None else 'NA'},"
+                f"world_size={world_size},"
+                f"time={epoch_time:.6f},"
+                f"sync_every={sync_every},"
+                f"syncs={syncs_this_epoch},"
                 f"commMB_per_step_fp16={commMB_per_step_fp16:.3f},"
                 f"commMB_per_step_fp32={commMB_per_step_fp32:.3f},"
                 f"commMB_per_step_fp64={commMB_per_step_fp64:.3f},"
-                f"commMB_epoch_fp16={comm_mb_epoch_fp16:.3f},commMB_cum_fp16={comm_mb_cum_fp16:.3f},"
-                f"commMB_epoch_fp32={comm_mb_epoch_fp32:.3f},commMB_cum_fp32={comm_mb_cum_fp32:.3f},"
-                f"commMB_epoch_fp64={comm_mb_epoch_fp64:.3f},commMB_cum_fp64={comm_mb_cum_fp64:.3f}",
+                f"commMB_epoch_fp16={comm_mb_epoch_fp16:.3f},"
+                f"commMB_cum_fp16={comm_mb_cum_fp16:.3f},"
+                f"commMB_epoch_fp32={comm_mb_epoch_fp32:.3f},"
+                f"commMB_cum_fp32={comm_mb_cum_fp32:.3f},"
+                f"commMB_epoch_fp64={comm_mb_epoch_fp64:.3f},"
+                f"commMB_cum_fp64={comm_mb_cum_fp64:.3f}",
                 flush=True
             )
+        if done:
+            break
+
     if is_rank0:
         print("Done.")
 
