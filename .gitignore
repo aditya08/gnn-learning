@@ -133,3 +133,15 @@ dmypy.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Plot build artifacts
+plots/build/
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.synctex.gz
+*.toc
+
+# Local scratch outputs
+results/*.pdf
