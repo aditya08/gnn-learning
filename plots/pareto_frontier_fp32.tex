@@ -1,0 +1,42 @@
+\documentclass[tikz]{standalone}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+\begin{document}
+\begin{tikzpicture}
+\begin{axis}[
+    width=12cm,
+    height=8cm,
+    xlabel={Total Communication (MB, fp32)},
+    ylabel={Best Micro-F1},
+    grid=both,
+    legend pos=south east,
+    ymin=0.94,
+    ymax=0.965
+]
+  \addplot+[
+    only marks,
+    mark=*,
+    mark size=0.9pt,
+    opacity=0.35
+  ] table[
+    x=commMB_cum_fp32,
+    y=best_microF1,
+    col sep=comma
+  ] {../results/pareto_all_fp32.csv};
+  \addlegendentry{All points}
+
+  \addplot+[
+    very thick,
+    color=red,
+    mark=*,
+    mark size=1.8pt
+  ] table[
+    x=commMB_cum_fp32,
+    y=best_microF1,
+    col sep=comma
+  ] {../results/pareto_frontier_fp32.csv};
+  \addlegendentry{Pareto frontier}
+\end{axis}
+\end{tikzpicture}
+\end{document}

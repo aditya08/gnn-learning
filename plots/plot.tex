@@ -1,0 +1,78 @@
+% Preamble:
+% \usepackage{pgfplots}
+% \pgfplotsset{compat=1.18}
+% \usepgfplotslibrary{groupplots}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{groupplot}[
+  group style={
+    group size=1 by 2,
+    vertical sep=1.2cm,
+  },
+  width=0.95\linewidth,
+  height=0.45\linewidth,
+  grid=both,
+  xlabel={Effective global optimizer steps},
+  mark size=1.5pt,
+  legend to name=synclegend,
+  legend columns=5,
+  legend style={/tikz/every even column/.append style={column sep=0.7em}},
+]
+
+% ---------- Top: microF1 ----------
+\nextgroupplot[
+  title={Reddit GraphSAGE: microF1 vs effective global steps},
+  ylabel={microF1 (val)},
+  ymin=0, ymax=1,
+]
+
+\newcommand{\plotsyncmicro}[1]{%
+  \addplot+[
+    mark=*,
+  ] table[
+    col sep=comma,
+    x=effective_global_steps,
+    y=microF1,
+    restrict expr to domain={\thisrow{sync_every}}{#1:#1},
+  ] {metrics.csv};
+  \addlegendentry{sync\_every=#1}
+}
+
+\plotsyncmicro{1}
+\plotsyncmicro{2}
+\plotsyncmicro{4}
+\plotsyncmicro{8}
+\plotsyncmicro{16}
+
+% ---------- Bottom: commMB_per_step_fp32 ----------
+\nextgroupplot[
+  title={Comm cost per step (fp32) vs effective global steps},
+  ylabel={commMB\_per\_step\_fp32},
+]
+
+\newcommand{\plotsynccomm}[1]{%
+  \addplot+[
+    mark=*,
+  ] table[
+    col sep=comma,
+    x=effective_global_steps,
+    y=commMB_per_step_fp32,
+    restrict expr to domain={\thisrow{sync_every}}{#1:#1},
+  ] {metrics.csv};
+}
+
+\plotsynccomm{1}
+\plotsynccomm{2}
+\plotsynccomm{4}
+\plotsynccomm{8}
+\plotsynccomm{16}
+
+\end{groupplot}
+
+% Shared legend (place it below)
+\node at ($(group c1r2.south)!0.5!(group c1r2.south) + (0,-1.2cm)$) {\pgfplotslegendfromname{synclegend}};
+
+\end{tikzpicture}
+\end{figure}

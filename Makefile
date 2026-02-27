@@ -10,6 +10,7 @@ TEX_FILE ?= plots/sync_ablation.tex
 PLOT_BUILD_DIR ?= plots/build
 
 .PHONY: sync-metrics merge-metrics figures all
+.PHONY: pareto-data pareto-figure pareto
 
 all: merge-metrics figures
 
@@ -21,3 +22,11 @@ merge-metrics:
 
 figures:
 	./scripts/build_figures.sh "$(TEX_FILE)" "$(PLOT_BUILD_DIR)"
+
+pareto-data:
+	python3 ./scripts/pareto_metrics.py --input "$(MERGED_CSV)"
+
+pareto-figure: pareto-data
+	./scripts/build_figures.sh "plots/pareto_frontier_fp32.tex" "$(PLOT_BUILD_DIR)"
+
+pareto: pareto-figure
