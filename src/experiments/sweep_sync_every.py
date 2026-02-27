@@ -144,7 +144,7 @@ def main():
     parser.add_argument("--nproc_per_node", type=int, default=4)
 
     # train.py arguments
-    parser.add_argument("--train_py", type=str, default="train.py")
+    parser.add_argument("--train_py", type=str, default="src/train.py")
     parser.add_argument("--max_steps", type=int, default=2000)
     parser.add_argument("--epochs", type=int, default=999)
     parser.add_argument("--batch_size", type=int, default=1024)

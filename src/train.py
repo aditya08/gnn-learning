@@ -10,11 +10,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch_geometric.datasets import Reddit
 from torch_geometric.loader import NeighborLoader
 
-from GraphSAGE import GraphSAGE
-from stat_metrics import eval_f1
-from perf_metrics import count_params
-from sync_schemes import build_sync_controller
-from utils import ddp_setup
+from distributed.sync_schemes import build_sync_controller
+from metrics.perf import count_params
+from metrics.stat import eval_f1
+from models.graphsage import GraphSAGE
+from runtime.ddp import ddp_setup
 
 def main():
     parser = argparse.ArgumentParser()
