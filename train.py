@@ -13,6 +13,7 @@ from torch_geometric.loader import NeighborLoader
 from GraphSAGE import GraphSAGE
 from stat_metrics import eval_f1
 from perf_metrics import count_params
+from sync_schemes import build_sync_controller
 from utils import ddp_setup
 
 def main():
@@ -28,6 +29,13 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--sync_every", type=int, default=1)
+    parser.add_argument(
+        "--sync_scheme",
+        type=str,
+        default="deferred_allreduce",
+        choices=["deferred_allreduce", "local_sgd"],
+        help="Synchronization strategy for distributed training.",
+    )
     parser.add_argument("--max_steps", type=int, default=None,
                     help="Total global optimizer steps (overrides epochs if set)")
     args = parser.parse_args()
@@ -71,8 +79,14 @@ def main():
         print(data)
 
     sync_every = args.sync_every
-    if sync_every < 1:
-        raise ValueError("--sync_every must be >= 1")
+    sync_controller = build_sync_controller(
+        scheme=args.sync_scheme,
+        sync_every=sync_every,
+        is_distributed=is_distributed,
+    )
+    # TODO(local-sgd): add an optional LocalSGD mode that performs k local optimizer
+    # steps and periodically averages model parameters across ranks (instead of using
+    # deferred gradient allreduce via DDP.no_sync).
 
     # Neighbor loaders for train/val/test
     train_loader = NeighborLoader(
@@ -135,25 +149,32 @@ def main():
         seed_nodes_epoch = 0
         steps = 0
         total_loss = 0.0
+        sync_controller.start_epoch(optimizer)
+        stop_requested = False
         for batch in train_loader:
-
             batch = batch.to(device)
-            optimizer.zero_grad(set_to_none=True)
 
-            out = model(batch.x, batch.edge_index)
-            y = batch.y[: batch.batch_size]
-            out = out[: batch.batch_size]
-            seed_nodes_epoch += batch.batch_size
-            loss = F.cross_entropy(out, y)
-            loss.backward()
-            optimizer.step()
+            with sync_controller.backward_context(model):
+                out = model(batch.x, batch.edge_index)
+                y = batch.y[: batch.batch_size]
+                out = out[: batch.batch_size]
+                seed_nodes_epoch += batch.batch_size
+                loss = F.cross_entropy(out, y)
+                sync_controller.backward(loss)
 
             total_loss += loss.item()
-
-            global_step += 1
             steps += 1
-            if max_local_steps is not None and global_step >= max_local_steps:
-                break
+
+            if sync_controller.maybe_step(model, optimizer):
+                global_step += 1
+                if max_local_steps is not None and global_step >= max_local_steps:
+                    stop_requested = True
+                    break
+
+        if sync_controller.finalize_epoch(model, optimizer, stop_requested=stop_requested):
+            global_step += 1
+
+        syncs_this_epoch = sync_controller.syncs_this_epoch
         seed_nodes_epoch_tensor = torch.tensor(seed_nodes_epoch, device=device, dtype=torch.long)
         if is_distributed:
             dist.all_reduce(seed_nodes_epoch_tensor, op=dist.ReduceOp.SUM)
@@ -165,8 +186,6 @@ def main():
         done = (max_local_steps is not None and global_step >= max_local_steps)
 
         avg_loss = total_loss / max(steps, 1)
-
-        syncs_this_epoch = (steps + sync_every - 1) // sync_every  # ceil(steps/k)
 
         comm_mb_epoch_fp16 = syncs_this_epoch * param_mb_fp16
         comm_mb_epoch_fp32 = syncs_this_epoch * param_mb_fp32
