@@ -46,6 +46,14 @@
       restrict expr to domain={\thisrow{sync_every}}{8:8}
   ] {../results/metrics.csv};
   \addlegendentry{sync\_every=8}
+
+  \addplot+[mark=none, very thick, densely dashdotdotted] table[
+      x=effective_global_steps,
+      y=microF1,
+      col sep=comma,
+      restrict expr to domain={\thisrow{sync_every}}{16:16}
+  ] {../results/metrics.csv};
+  \addlegendentry{sync\_every=16}
 \end{axis}
 \end{tikzpicture}
 \end{document}
